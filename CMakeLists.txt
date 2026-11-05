@@ -212,6 +212,8 @@ if (MSVC AND NOT CXX_CLANG)
     # This was dripping into spirv, being overriden, and causing cl flag override warning
     # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W3 /WX-")
     set(CMAKE_CXX_FLAGS_INIT "${CMAKE_CXX_FLAGS_INIT} /W3 /WX-")
+    # Per-game code in nx2 branches shadows locals; MSVC reports C4456/C4458 as an error here.
+    add_compile_options(/wd4456 /wd4458)
 endif()
 
 # Set runtime library to MD/MDd for all configurations
