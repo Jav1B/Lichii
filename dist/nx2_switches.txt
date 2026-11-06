@@ -14,6 +14,16 @@ EDEN_NX2_SPLIT=2
 # Batch GPU fence syncpoints to reduce host driver overhead and smooth frametimes.
 EDEN_NX2_FENCE_BATCH=1
 
+# --- Ocarina of Time (0400486024DEC000): measured on this PC, best of the A/B runs ---
+# Keep read traps and flush on demand for native titles. Measured: best of the PREFLUSH A/B
+# (upstream #259 reports Kokiri ~26 -> ~40 fps; watch for flicker on foliage/HUD).
+EDEN_NX2_PREFLUSH=1
+
+# Let native draws follow the legacy skip heuristic instead of holding the frame for an
+# unbuilt pipeline (#224). Removes the "draws held for unbuilt pipelines" stutter; the
+# trade-off is a draw that can be missing for a single frame while its pipeline compiles.
+EDEN_NX2_ASYNC_DISCARD=1
+
 # Leave buffer downloads disabled on Switch 2 (default): forcing downloads (=1) copies back
 # 90-220 MB/s of buffers CPU never touches, causing heavy mutex contention and dropping FPS by ~38-63%.
 #EDEN_NX2_BUFFER_DOWNLOADS=1

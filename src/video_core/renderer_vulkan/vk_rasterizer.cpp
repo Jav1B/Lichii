@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <limits>
 #include <cstdio>
@@ -279,8 +280,11 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
                      gpu.ShaderNotify()),
       accelerate_dma(buffer_cache, texture_cache, scheduler),
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
-      frame_dump(device, memory_allocator, scheduler), wfi_event(device.GetLogical().CreateEvent()) {
+      frame_dump(device, memory_allocator, scheduler) {
     scheduler.SetQueryCache(query_cache);
+    buffer_cache.SetPendingCpuWrites([this](const std::function<void(DAddr, size_t)>& callback) {
+        gpu.ForEachPendingCpuWrite(callback);
+    });
     VideoCommon::GpuSplit::Get().SetIdleHook(
         [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
         &scheduler);
@@ -431,6 +435,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         report_failure("no pipeline");
         TraceRenderState(is_indexed, "no-pipeline", nullptr);
         return;
+    }
+    if (VideoCommon::OotNetwork::BypassEnabled(Settings::GetCurrentProgramID())) {
+        TrackOotTonemappedImage(*pipeline);
     }
     // Task/mesh pipelines: the draw's vertex count is the number of task workgroups.
     mesh_draw = pipeline->IsMeshPipeline();
@@ -933,6 +940,18 @@ void RasterizerVulkan::DrawIndirect() {
     buffer_cache.SetDrawIndirect(nullptr);
 }
 
+void RasterizerVulkan::TrackOotTonemappedImage(const GraphicsPipeline& pipeline) {
+    const auto& hashes = pipeline.ShaderHashes();
+    if (std::none_of(hashes.begin(), hashes.end(), VideoCommon::OotNetwork::IsTonemapShader)) {
+        return;
+    }
+    const GPUVAddr target = maxwell3d->regs.rt[0].Address();
+    if (target != 0 &&
+        oot_network_bypass.tonemapped_image.exchange(target, std::memory_order_relaxed) != target) {
+        LOG_INFO(Render_Vulkan, "Ocarina of Time: tonemapped image at {:#x}", target);
+    }
+}
+
 void RasterizerVulkan::TraceDrawFailure(std::string_view reason) {
     if (!Common::DkbFrameTrace::Enabled()) {
         return;
@@ -1411,6 +1430,23 @@ void RasterizerVulkan::DispatchCompute() {
 
     const auto& qmd{kepler_compute->launch_description};
     auto indirect_address = kepler_compute->GetIndirectComputeAddress();
+    // Earlier writes must be visible to the dispatch, its indirect arguments included, and what it
+    // writes to the next render pass.
+    const auto record_read_barrier = [this] {
+        static constexpr VkMemoryBarrier READ_BARRIER{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+        };
+        scheduler.Record([](vk::CommandBuffer cmdbuf) {
+            cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                                   VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+                                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   0, READ_BARRIER);
+        });
+        scheduler.NoteComputeWrites();
+    };
     if (frame_dump.CapturingBuffers()) {
         std::optional<std::array<u32, 3>> indirect_grid;
         if (indirect_address) {
@@ -1430,6 +1466,7 @@ void RasterizerVulkan::DispatchCompute() {
         const auto [buffer, offset] =
             buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
         scheduler.RequestOutsideRenderPassOperationContext();
+        record_read_barrier();
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
         scheduler.Record([this, pipeline, indirect_buffer = buffer->Handle(),
                           indirect_offset = offset](vk::CommandBuffer cmdbuf) {
@@ -1449,14 +1486,7 @@ void RasterizerVulkan::DispatchCompute() {
         return;
     }
     scheduler.RequestOutsideRenderPassOperationContext();
-    static constexpr VkMemoryBarrier READ_BARRIER{
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .pNext = nullptr,
-        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
-    };
-    scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                               0, READ_BARRIER); });
+    record_read_barrier();
     scheduler.TraceComputePipeline(pipeline->ShaderHash());
     scheduler.Record([this, pipeline, dim, byte_addressed_shadow](vk::CommandBuffer cmdbuf) {
         if (!pipeline->IsBound()) {
@@ -1591,13 +1621,24 @@ bool RasterizerVulkan::HasPendingQueries(DAddr addr, u64 size) {
     return query_cache.IsRegionGpuModified(addr, size);
 }
 
+void RasterizerVulkan::SubmitQueryWork() {
+    // The guest writes of the pending reports run when the GPU passes this fence.
+    fence_manager.SignalReference();
+    scheduler.Flush();
+}
+
 VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
+    std::optional<VideoCore::RasterizerDownloadArea> texture_area;
     {
         std::scoped_lock lock{texture_cache.mutex};
-        auto area = texture_cache.GetFlushArea(addr, size);
-        if (area) {
-            return *area;
-        }
+        texture_area = texture_cache.GetFlushArea(addr, size);
+    }
+    if (texture_area) {
+        // The core disarmed the read's pages before asking: the buffer cache arms only pages it
+        // doesn't count as armed, so it must forget these.
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.ForgetReadTraps(addr, size);
+        return *texture_area;
     }
     if (buffer_cache.FlushesOnCpuRead()) {
         std::scoped_lock lock{buffer_cache.mutex};
@@ -1696,6 +1737,16 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
     pipeline_cache.InvalidateRegion(addr, size);
 }
 
+void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.ClaimCpuWrites(ranges);
+    }
+    for (const auto& [addr, size] : ranges) {
+        OnCacheInvalidation(addr, size);
+    }
+}
+
 bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) return true;
     {
@@ -1756,6 +1807,27 @@ void RasterizerVulkan::ReleaseFences(bool force) {
     fence_manager.WaitPendingFences(force);
 }
 
+void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
+    if (addr == 0 || size == 0 || !query_cache.SemiFlushRegion(addr, size)) {
+        return;
+    }
+    // Below High GPU accuracy a fence runs its own callback at once, so wait for an operation
+    // queued behind the pending report writes instead. On the split's back the fence's
+    // submission may be deferred, and the fencing thread would wait for this thread to submit it.
+    std::mutex wait_mutex;
+    std::condition_variable wait_cv;
+    bool written{};
+    fence_manager.SyncOperation([&] {
+        std::scoped_lock lock{wait_mutex};
+        written = true;
+        wait_cv.notify_all();
+    });
+    fence_manager.SignalFence([] {});
+    scheduler.FlushDeferred();
+    std::unique_lock lock{wait_mutex};
+    wait_cv.wait(lock, [&written] { return written; });
+}
+
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
                                                 VideoCommon::CacheType which) {
     if (Settings::IsGPULevelHigh()) {
@@ -1785,9 +1857,15 @@ void RasterizerVulkan::WaitForIdle() {
         return;
     }
     scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([event = *wfi_event, flags](vk::CommandBuffer cmdbuf) {
-        cmdbuf.SetEvent(event, flags);
-        cmdbuf.WaitEvents(event, flags, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, {}, {}, {});
+    scheduler.Record([flags](vk::CommandBuffer cmdbuf) {
+        // Later work waits for the earlier work and sees its writes.
+        static constexpr VkMemoryBarrier WFI_BARRIER{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+        };
+        cmdbuf.PipelineBarrier(flags, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, WFI_BARRIER);
     });
     fence_manager.SignalOrdering();
 }
